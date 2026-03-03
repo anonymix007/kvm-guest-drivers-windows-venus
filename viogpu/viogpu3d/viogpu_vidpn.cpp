@@ -46,13 +46,21 @@ VioGpuVidPN::~VioGpuVidPN()
     m_ModeInfo = NULL;
     m_ModeNumbers = NULL;
 
+#ifdef FLIP_TIMER
+    EXT_DELETE_PARAMETERS parameters;
+    ExInitializeDeleteTimerParameters(&parameters);
+    ExDeleteTimer(m_pFlipTimer, TRUE, TRUE, &parameters);
+#else
     m_shouldFlipStop = true;
 
     KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, NULL);
     ObDereferenceObject(m_pFlipThread);
+#endif
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
+
+constexpr LONGLONG FLIP_INTERVAL = 10000000LL / 60;
 
 NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
 {
@@ -125,6 +133,20 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
     DbgPrint(TRACE_LEVEL_INFORMATION,
              ("<--- %s ColorFormat = %d\n", __FUNCTION__, m_CurrentModes[0].DispInfo.ColorFormat));
 
+#ifdef FLIP_TIMER
+    DbgPrint(TRACE_LEVEL_INFORMATION,
+             ("<--- %s ExAllocateTimer(%p, %p, %d)\n", __FUNCTION__, VioGpuVidPN::FlipTimer, this, EX_TIMER_HIGH_RESOLUTION));
+
+    m_pFlipTimer = ExAllocateTimer(VioGpuVidPN::FlipTimer, this, EX_TIMER_HIGH_RESOLUTION);
+
+    if (m_pFlipTimer == NULL)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,("%s failed to allocate timer\n", __FUNCTION__));
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ExSetTimer(m_pFlipTimer, -FLIP_INTERVAL, FLIP_INTERVAL, NULL);
+#else
     HANDLE threadHandle = 0;
     m_shouldFlipStop = false;
     Status = PsCreateSystemThread(&threadHandle, (ACCESS_MASK)0, NULL, (HANDLE)0, NULL, VioGpuVidPN::FlipThread, this);
@@ -132,7 +154,7 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
     ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)(&m_pFlipThread), NULL);
 
     ZwClose(threadHandle);
-
+#endif
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     return Status;
@@ -166,6 +188,13 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
     LARGE_INTEGER timeout = {0};
     timeout.QuadPart = Int32x32To64(1000, -10000);
 
+#ifdef FLIP_TIMER
+    if (!ExCancelTimer(m_pFlipTimer, NULL))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to cancel the flip timer\n"));
+        VioGpuDbgBreak();
+    }
+#else
     m_shouldFlipStop = TRUE;
 
     if (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
@@ -175,6 +204,7 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
     }
 
     ObDereferenceObject(m_pFlipThread);
+#endif
 
     BlackOutScreen(&m_CurrentModes[SourceId]);
     DestroyFrameBufferObj(TRUE);
@@ -197,7 +227,11 @@ void VioGpuVidPN::Powerdown()
     DestroyFrameBufferObj(TRUE);
     m_CurrentModes[0].Flags.FrameBufferIsActive = FALSE;
     m_CurrentModes[0].FrameBuffer.Ptr = NULL;
+#ifdef FLIP_TIMER
+    ExCancelTimer(m_pFlipTimer, NULL);
+#else
     m_shouldFlipStop = true;
+#endif
 }
 
 NTSTATUS VioGpuVidPN::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVidPn)
@@ -1982,10 +2016,18 @@ void VioGpuVidPN::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
     SetVideoModeInfo(m_CustomModeIndex, &tmpModeInfo);
 }
 
+PAGED_CODE_SEG_END
+
+//
+// Non-Paged Code
+//
+#pragma code_seg(push)
+#pragma code_seg()
+
+static ULONGLONG prev_time = 0;
+
 void VioGpuVidPN::Flip()
 {
-    PAGED_CODE();
-
     if (InterlockedExchange(&m_shouldFlip, 0))
     {
         if (m_sourceAddress.QuadPart != 0 && m_sourceRes != NULL)
@@ -1994,9 +2036,15 @@ void VioGpuVidPN::Flip()
         }
         else
         {
+            //VirtioDebugPrintProc("VioGpuVidPN::Flip SetScanout(0)\n");
             m_pAdapter->ctrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
         }
+        //LARGE_INTEGER time;
+        //KeQuerySystemTimePrecise(&time);
+        //VirtioDebugPrintProc("VioGpuVidPN::Flip interval=%llu sourceAddress=%llx sourceRes=%p\n", time.QuadPart - prev_time, m_sourceAddress.QuadPart, m_sourceRes);
+        //prev_time = time.QuadPart;
     }
+
     DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt;
     interrupt.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
 
@@ -2006,31 +2054,35 @@ void VioGpuVidPN::Flip()
     m_pAdapter->NotifyInterrupt(&interrupt, true);
 }
 
-void VioGpuVidPN::FlipThread(void *ctx)
+#ifdef FLIP_TIMER
+void VioGpuVidPN::FlipTimer(PEX_TIMER timer, void *ctx)
 {
-    PAGED_CODE();
+    UNREFERENCED_PARAMETER(timer);
 
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
-    LARGE_INTEGER interval;
-    interval.QuadPart = -166666LL;
+    vidpn->Flip();
+}
+#else
+void VioGpuVidPN::FlipThread(void *ctx)
+{
+    VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
+
     while (true)
     {
-        KeDelayExecutionThread(KernelMode, false, &interval);
+        LARGE_INTEGER time;
+        KeQuerySystemTimePrecise(&time);
+        time.QuadPart += FLIP_INTERVAL;
+
         if (vidpn->m_shouldFlipStop)
         {
             return;
         }
         vidpn->Flip();
+
+        KeDelayExecutionThread(KernelMode, false, &time);
     }
 }
-
-PAGED_CODE_SEG_END
-
-//
-// Non-Paged Code
-//
-#pragma code_seg(push)
-#pragma code_seg()
+#endif
 
 NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
 {

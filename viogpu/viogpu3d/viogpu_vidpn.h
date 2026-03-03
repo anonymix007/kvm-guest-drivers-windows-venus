@@ -33,6 +33,8 @@ typedef struct _CURRENT_MODE
     } FrameBuffer;
 } CURRENT_MODE;
 
+#define FLIP_TIMER
+
 class VioGpuVidPN
 {
   public:
@@ -99,7 +101,11 @@ class VioGpuVidPN
                             _In_ INT PositionY);
 
     void Flip();
+#ifdef FLIP_TIMER
+    static void FlipTimer(PEX_TIMER timer, void *ctx);
+#else
     static void FlipThread(void *ctx);
+#endif
 
     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
 
@@ -139,6 +145,10 @@ class VioGpuVidPN
     VioGpuAllocation *m_sourceRes = NULL;
     volatile LONG m_shouldFlip = 0;
 
+#ifdef FLIP_TIMER
+    PEX_TIMER m_pFlipTimer;
+#else
     PETHREAD m_pFlipThread;
     BOOL m_shouldFlipStop = false;
+#endif
 };
